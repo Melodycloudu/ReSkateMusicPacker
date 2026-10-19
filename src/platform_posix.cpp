@@ -192,6 +192,12 @@ std::string environment(const char* name) {
     return value ? value : "";
 }
 
+void set_environment(const char* name, std::string_view value) {
+    if (value.empty()) { unsetenv(name); return; }
+    const std::string text(value);
+    setenv(name, text.c_str(), 1);
+}
+
 void add_to_path(const fs::path& folder) {
     if (folder.empty()) return;
     for (const auto& existing : path_folders()) if (existing == folder.string()) return;

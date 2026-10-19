@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2026 DeckardDetribine and the ReSkateMusicPacker contributors
 // SPDX-License-Identifier: GPL-3.0-only
 // ReSkateMusicPacker as a library: songs in, an add-only music mod out. packer.cpp says how.
-// Needs ffmpeg and ffprobe on PATH. Not thread-safe: one scan or pack at a time (they share a
-// scratch folder in %TEMP%).
+// Needs ffmpeg and ffprobe on PATH. Not thread-safe: one scan or pack at a time. (Inside pack(),
+// though, songs are encoded in parallel; the scratch names are per song for that reason.)
 #pragma once
 #include <atomic>
 #include <cstddef>
@@ -33,12 +33,23 @@ struct PackOptions {
     std::string playlist;                  // the songs' playlist in the music menu
     int bitrate = 192;                     // kbps, 64-320
     bool normalize = true;                 // EBU R128 loudness normalization (-16 LUFS) via ffmpeg loudnorm
+    // How many songs to encode at once. 0 picks a default from the CPU count, which can be
+    // overridden by the RESKATE_JOBS environment variable. This changes only how long the pack
+    // takes, never the mod it produces.
+    int jobs = 0;
     std::map<std::string, std::filesystem::path> playlist_artwork;
     std::set<std::string> generated_playlist_artwork; // playlist names; manual images take priority
 };
 
+// The job count pack() would use for `options`: options.jobs, else RESKATE_JOBS, else half the
+// logical CPUs, capped at 64. Songs are only ever capped by how many there are.
+std::size_t encode_slots_for(const PackOptions& options);
+
 // One step of pack(). `stage` is "encoding" (detail empty), "encoded" (detail: length, packets
 // and size), "building" or "writing"; the last two are about the whole mod and have song == count.
+// A progress function may be called from a worker thread, but never re-entrantly. Because songs
+// encode in parallel, a song's "encoding" and "encoded" need not be adjacent, and song indices
+// need not arrive in order: use step.song to look a song up, not to pair events up.
 struct Progress {
     std::size_t song, count;
     const char* stage;
@@ -82,7 +93,8 @@ std::vector<std::byte> playlist_artwork_png(const std::string& name);
 
 // Builds the mod into options.output (any files already there are overwritten). Throws
 // std::runtime_error with a message fit to show, or Cancelled. `progress` and `cancel` may be null;
-// cancel is checked between songs. Songs keep their given order; artist/title override the tags.
+// cancel is checked between songs, and because songs encode in parallel a cancel lets the songs
+// already being encoded finish first. Songs keep their given order; artist/title override the tags.
 PackResult pack(const PackOptions& options, const std::vector<SongInfo>& songs, const ProgressFn& progress = {},
                 const std::atomic<bool>* cancel = nullptr);
 

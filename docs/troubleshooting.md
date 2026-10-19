@@ -47,6 +47,17 @@ The packer normalises to **-15 LUFS** (true peak -1.5 dBTP) with two-pass `loudn
 game's own tracks sit at. If you disabled normalisation, or if you're comparing against a differently
 mastered source, this will differ. Use `--no-normalize` to pack the source level unchanged.
 
+## The build is slow, or it makes the machine unresponsive
+
+Encoding is the slow part, and it runs several songs at once by default. Songs are cached by source
+hash, so a rebuild only re-encodes what changed; deleting the cache folder forces everything again.
+
+To trade speed for a responsive machine, lower the count in **Settings... → Parallel encoding**, with
+`--jobs <n>` per build, or `RESKATE_JOBS` for scripts. The GUI shows the number it will actually use.
+Raising it does not change the mod, only how fast it arrives. Note that each ffmpeg process asks for
+several threads of its own, so more songs than logical cores usually makes things slower rather than
+faster.
+
 ## The build fails with "cannot open ReSkateMusicPacker.exe"
 
 A previous copy of the packer (or the GUI) is still running and holding the file. Close it and rebuild.
@@ -68,7 +79,7 @@ generated `README.md` tracklist and a 256x256 `icon.png`.
 
 | | Windows | macOS | Linux |
 |---|---|---|---|
-| Settings | `%APPDATA%\ReSkateMusicPacker\settings.json` | `~/Library/Application Support/ReSkateMusicPacker/settings.json` | `$XDG_CONFIG_HOME` or `~/.config/ReSkateMusicPacker/settings.json` |
+| Settings (game folder, ffmpeg, parallel encoding) | `%APPDATA%\ReSkateMusicPacker\settings.json` | `~/Library/Application Support/ReSkateMusicPacker/settings.json` | `$XDG_CONFIG_HOME` or `~/.config/ReSkateMusicPacker/settings.json` |
 | Encode cache (delete to force a full re-encode) | `%LOCALAPPDATA%\ReSkateMusicPacker\cache\` | `~/Library/Caches/ReSkateMusicPacker/cache/` | `$XDG_CACHE_HOME` or `~/.cache/ReSkateMusicPacker/cache/` |
 | Downloaded ffmpeg | `.\ffmpeg` beside the app (portable) or `%LOCALAPPDATA%\ReSkateMusicPacker\ffmpeg` | - | - |
 

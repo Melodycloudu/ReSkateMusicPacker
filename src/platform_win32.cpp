@@ -118,6 +118,13 @@ std::string environment(const char* name) {
     return narrow(value);
 }
 
+void set_environment(const char* name, std::string_view value) {
+    const auto wide_name = widen(name);
+    if (value.empty()) { SetEnvironmentVariableW(wide_name.c_str(), nullptr); return; }
+    const auto wide_value = widen(value);
+    SetEnvironmentVariableW(wide_name.c_str(), wide_value.c_str());
+}
+
 void add_to_path(const fs::path& folder) {
     if (folder.empty()) return;
     std::wstring path(GetEnvironmentVariableW(L"PATH", nullptr, 0), L'\0');

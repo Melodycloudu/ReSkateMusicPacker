@@ -31,9 +31,11 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -45,6 +47,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -88,7 +91,6 @@ void write_file(const fs::path& path, std::span<const std::byte> bytes) {
     out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     if (!out) throw std::runtime_error("Cannot write " + path.string());
 }
-
 fb::Sha1 sha1_of(std::span<const std::byte> bytes) {
     music::Sha1 hash;
     hash.update(bytes);
@@ -97,12 +99,13 @@ fb::Sha1 sha1_of(std::span<const std::byte> bytes) {
     std::memcpy(result.bytes.data(), digest.data(), 20);
     return result;
 }
-std::string to_hex(const fb::Sha1& sha) {
-    char hex[41];
-    for (std::size_t i = 0; i < 20; ++i)
-        std::snprintf(hex + i * 2, 3, "%02x", static_cast<unsigned char>(sha.bytes[i]));
-    return std::string(hex, 40);
+template <std::size_t N> std::string to_hex(const std::array<std::byte, N>& bytes) {
+    std::string hex(N * 2, '\0');
+    for (std::size_t i = 0; i < N; ++i)
+        std::snprintf(hex.data() + i * 2, 3, "%02x", static_cast<unsigned char>(bytes[i]));
+    return hex;
 }
+std::string to_hex(const fb::Sha1& sha) { return to_hex(sha.bytes); }
 fb::Sha1 sha1_of_file(const fs::path& path) {
     const auto digest = music::sha1_file(path);
     fb::Sha1 result;
@@ -125,6 +128,19 @@ fb::Guid new_guid() {
     result.bytes[7] = static_cast<std::byte>((std::to_integer<unsigned>(result.bytes[7]) & 0x0F) | 0x40);
     result.bytes[8] = static_cast<std::byte>((std::to_integer<unsigned>(result.bytes[8]) & 0x3F) | 0x80);
     return result;
+}
+
+// A cache entry goes in whole or not at all: it is written under a name of its own and renamed
+// into place. The destination is therefore only ever created whole, and never truncated while
+// another thread reads it. When the rename loses a race the entry is simply dropped: two writers
+// of one path are encoding the same source bytes, so what they would have written is identical.
+void write_file_atomic(const fs::path& path, std::string_view text) {
+    auto temporary = path;
+    temporary += ".tmp." + to_hex(new_guid().bytes);
+    write_file(temporary, std::as_bytes(std::span(text.data(), text.size())));
+    std::error_code ec;
+    fs::rename(temporary, path, ec);
+    if (ec) fs::remove(temporary, ec);
 }
 
 using platform::narrow;
@@ -166,6 +182,12 @@ void zip_write(const fs::path& archive, const fs::path& folder) {
 
 // ---- metadata ----------------------------------------------------------------------------------
 
+// The bundle stores asset names lowercased.
+std::string lowered(std::string text) {
+    std::ranges::transform(text, text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return text;
+}
+
 // Artist and title as the music menu shows them: the song's id is "artist - title".
 bool usable(const std::string& text) {
     return !text.empty() && text.size() <= 255 &&
@@ -187,7 +209,11 @@ fs::path scratch_folder() {
     const auto base = platform::cache_directory();
     const auto scratch = (base.empty() ? fs::temp_directory_path() : base) / "ReSkateMusicPacker" / "scratch";
 #endif
-    fs::create_directories(scratch);
+    std::error_code ec;   // several threads may create it at once; that is not a failure
+    fs::create_directories(scratch, ec);
+    std::error_code missing;
+    if (!fs::is_directory(scratch, missing))
+        throw std::runtime_error("Cannot create " + scratch.string());
     return scratch;
 }
 
@@ -284,8 +310,24 @@ Opus read_ogg_opus(std::span<const std::byte> ogg) {
 constexpr char loudness_filter[] = "I=-15.0:TP=-1.5:LRA=11";
 constexpr char loudness_cache_tag[] = "_norm15";
 
-std::string loudness_af(const fs::path& file) {
+std::string loudness_af(const fs::path& file, const std::string& fileKey) {
     const auto base = std::string("loudnorm=") + loudness_filter;
+    // The measurement depends on the source audio and the target, never on the bitrate, so it is
+    // cached on its own: rebuilding at another bitrate re-encodes without decoding every song a
+    // second time just to measure it. Only a real measurement is stored, and the prefix is checked
+    // on read, so a damaged or stale entry is measured again rather than used.
+    const auto cached = cache_folder() / widen(fileKey + "_measure_" + loudness_cache_tag + ".json");
+    std::error_code ignored;
+    if (fs::is_regular_file(cached, ignored)) {
+        std::ifstream in(cached, std::ios::binary);
+        const std::string stored{std::istreambuf_iterator<char>(in), {}};
+        // The prefix only proves the entry is for this target; the tail is where a truncated or
+        // half-written one gives itself away, and that tail is exactly what ffmpeg parses.
+        if (stored.starts_with(base) && stored.ends_with(":linear=true") &&
+            stored.find(":measured_I=") != std::string::npos && stored.find(":measured_TP=") != std::string::npos &&
+            stored.find(":measured_thresh=") != std::string::npos && stored.find(":offset=") != std::string::npos)
+            return stored;
+    }
     try {
         const auto text = run_capture({"ffmpeg", "-hide_banner", "-nostats", "-i", path_utf8(file), "-vn", "-map_metadata", "-1",
                                        "-ac", "2", "-ar", "48000", "-af", base + ":print_format=json", "-f", "null", "-"});
@@ -298,17 +340,41 @@ std::string loudness_af(const fs::path& file) {
         const auto i = value("input_i"), lra = value("input_lra"), tp = value("input_tp");
         const auto thresh = value("input_thresh"), offset = value("target_offset");
         if (i.empty() || tp.empty()) return base;
-        return base + ":measured_I=" + i + ":measured_LRA=" + lra + ":measured_TP=" + tp +
-               ":measured_thresh=" + thresh + ":offset=" + offset + ":linear=true";
+        auto measured = base + ":measured_I=" + i + ":measured_LRA=" + lra + ":measured_TP=" + tp +
+                        ":measured_thresh=" + thresh + ":offset=" + offset + ":linear=true";
+        try { write_file_atomic(cached, measured); } catch (const std::exception&) {}
+        return measured;
     } catch (const std::exception&) {
         return base; // measurement failed: fall back to the dynamic filter
     }
 }
 
-EncodedOpus encode(const Song& song, int bitrate, bool normalize, const fs::path& scratch) {
-    const auto fileSha = sha1_of_file(song.file);
-    const auto cacheKey = to_hex(fileSha) + "_" + std::to_string(bitrate) + "k" + (normalize ? loudness_cache_tag : "") + ".ogg";
-    const auto cachedFile = cache_folder() / widen(cacheKey);
+// A plain count from a string: digits only, whole string, no sign. strtoul reads a leading '-' as
+// a sign and hands back ULONG_MAX, and a partial parse would take "8ffmpeg" as 8.
+bool count_from(std::string_view text, int& out) {
+    int value = 0;
+    const auto* first = text.data();
+    const auto [stop, error] = std::from_chars(first, first + text.size(), value);
+    if (error != std::errc{} || stop != first + text.size() || value <= 0) return false;
+    out = value;
+    return true;
+}
+
+// The cap is not decoration: RESKATE_JOBS=4096 on a laptop is a fork bomb, not a setting.
+std::size_t capped_slots(int requested) {
+    return std::clamp<std::size_t>(static_cast<std::size_t>(requested), 1, 64);
+}
+
+// Half the logical CPUs: each ffmpeg already wants several threads of its own, so this keeps every
+// core busy without the pile-on that makes all of them slower.
+std::size_t automatic_slots() {
+    return std::max<std::size_t>(1, std::thread::hardware_concurrency() / 2);
+}
+
+EncodedOpus encode(const Song& song, int bitrate, bool normalize, const fs::path& scratch, std::size_t index) {
+    const auto fileSha = to_hex(sha1_of_file(song.file));
+    const auto tag = std::to_string(bitrate) + "k" + (normalize ? loudness_cache_tag : "");
+    const auto cachedFile = cache_folder() / widen(fileSha + "_" + tag + ".ogg");
 
     std::error_code ec;
     if (fs::exists(cachedFile, ec)) {
@@ -325,9 +391,12 @@ EncodedOpus encode(const Song& song, int bitrate, bool normalize, const fs::path
         fs::remove(cachedFile, ec);
     }
 
-    const auto ogg = scratch / (to_hex(fileSha) + "_" + std::to_string(bitrate) + "k" + (normalize ? loudness_cache_tag : "") + ".tmp.ogg");
+    // The song index keeps two songs with identical bytes (the same file added under two names)
+    // from handing `ffmpeg -y` the same output path. It has to be the index, not a pool slot:
+    // a slot is reused, so the same two songs could still meet on one name.
+    const auto ogg = scratch / widen(fileSha + "_" + std::to_string(index) + "_" + tag + ".tmp.ogg");
     Args command{"ffmpeg", "-y", "-v", "error", "-i", path_utf8(song.file), "-vn", "-map_metadata", "-1", "-ac", "2", "-ar", "48000"};
-    if (normalize) command.insert(command.end(), {"-af", loudness_af(song.file)});
+    if (normalize) command.insert(command.end(), {"-af", loudness_af(song.file, fileSha)});
     command.insert(command.end(), {"-c:a", "libopus", "-b:a", std::to_string(bitrate) + "k", "-vbr", "on", "-frame_duration", "20",
                                    "-application", "audio", "-f", "ogg", path_utf8(ogg)});
     run(command);
@@ -335,11 +404,10 @@ EncodedOpus encode(const Song& song, int bitrate, bool normalize, const fs::path
     for (const auto& packet : opus.packets)
         if (samples_in(packet) != packet_samples) throw std::runtime_error("ffmpeg produced a packet that is not 20 ms");
 
+    // Rename only: copying onto the destination would truncate the entry another thread may be
+    // reading. Losing this race costs nothing, since the same source bytes encode identically.
     fs::rename(ogg, cachedFile, ec);
-    if (ec) {
-        fs::copy_file(ogg, cachedFile, fs::copy_options::overwrite_existing, ec);
-        fs::remove(ogg, ec);
-    }
+    if (ec) fs::remove(ogg, ec);
 
     return EncodedOpus{std::move(opus), false};
 }
@@ -634,6 +702,97 @@ std::vector<std::byte> wave_resource(std::vector<std::byte> blob, const WaveFact
     return blob;
 }
 
+// What one song contributes to the mod. It is built apart from the playlist document and the
+// chunk/asset vectors so that several songs can be here at once.
+struct EncodedSong {
+    std::vector<std::byte> prefetch, stream;
+    fb::Guid prefetchId, streamId;            // made here, appended to `chunks` in song order
+    fb::Guid songFileGuid, songInstanceGuid;  // the song's partition and its MusicGraphAsset
+    std::vector<Built> assets;                // the wave's EBX, then the song's
+    std::vector<Built> resources;             // the wave's sound-bank resource
+    std::string detail;                       // what the progress report shows
+    std::exception_ptr error;                 // read only after the pool has joined
+};
+
+// One song end to end: encode it, build its two chunks, and write the wave and song documents plus
+// the wave's sound-bank resource. Every input is read-only and the only shared state reached is
+// new_guid(), which is already locked, so several songs may do this at the same time.
+EncodedSong encode_song(const Song& song, std::size_t index, int bitrate, bool normalize, const fs::path& scratch,
+                        std::span<const std::byte> waveBytes, std::span<const std::byte> songBytes,
+                        const fb::Guid& templateFile, std::span<const std::byte, 10> templateHeader,
+                        std::span<const std::byte> templatePrefetch, const WaveFacts& templateFacts,
+                        std::span<const std::byte> templateBlob) {
+    EncodedSong result;
+    const auto encoded = encode(song, bitrate, normalize, scratch, index);
+    const auto& opus = encoded.opus;
+    const auto samples = playable_samples(opus);
+    const auto header = codec_header(templateHeader, samples);
+    result.stream = stream_chunk(opus, header);
+    result.prefetch = prefetch_chunk(templatePrefetch, opus, header, result.stream);
+    char detail[96];
+    std::snprintf(detail, sizeof detail, "%.1f s, %zu packets, %zu KB%s", opus.samples / 48000.0, opus.packets.size(),
+                  result.stream.size() / 1024, encoded.cached ? " (cached)" : "");
+    result.detail = detail;
+
+    // The wave: fresh partition, its own two chunks. Parsed anew per song: a copied
+    // Document shares its instances' objects with the original.
+    auto wave = ebx::read_document(waveBytes);
+    renew(wave);
+    auto& waveRoot = *root_of(wave, "NewWaveAsset").object;
+    const auto waveName = std::string(asset_folder) + song.slug + "_NWA";
+    field(waveRoot, "Name").value.data = waveName;
+    auto& waveChunks = std::get<ebx::Value::Array>(field(waveRoot, "Chunks").value.data);
+    if (waveChunks.size() != 2) throw std::runtime_error("Template wave does not have two chunks");
+    for (std::size_t k = 0; k < 2; ++k) {
+        const auto& bytes = k == 0 ? result.prefetch : result.stream;
+        auto& entry = *std::get<std::shared_ptr<ebx::Object>>(waveChunks[k].data);
+        const auto id = new_guid();
+        field(entry, "ChunkId").value.data = id;
+        set_number(field(entry, "ChunkSize"), bytes.size());
+        if (k == 0) result.prefetchId = id; else result.streamId = id;
+    }
+
+    // The song: fresh partition, its music segment's wave import pointing at the new wave.
+    auto graph = ebx::read_document(songBytes);
+    renew(graph);
+    bool rewired = false;
+    for (auto& import : graph.imports)
+        if (import.fileGuid == templateFile) {
+            import = {wave.fileGuid, root_of(wave, "NewWaveAsset").instanceGuid};
+            rewired = true;
+        }
+    if (!rewired) throw std::runtime_error("Template song does not import its wave");
+    const auto songName = std::string(asset_folder) + song.slug + "_MG";
+    auto& graphRoot = *root_of(graph, "MusicGraphAsset").object;
+    field(graphRoot, "Name").value.data = songName;
+    set_number(field(graphRoot, "NameHash"), name_hash(songName));
+    auto& metadata = *root_of(graph, "DingoMusicMetadata").object;
+    field(metadata, "ArtistName").value.data = song.artist;
+    field(metadata, "TrackName").value.data = song.title;
+    // No station tag: the template's would list the song under its station (Turkish).
+    // The playlist comes from reskate-music.json instead; the licensed songs carry no
+    // tags either. The orphaned MusicAssetTag instance is harmless.
+    std::get<ebx::Value::Array>(field(graphRoot, "TagRefs").value.data).clear();
+    std::get<ebx::Value::Array>(field(graphRoot, "Tags").value.data).clear();
+    result.songFileGuid = graph.fileGuid;
+    result.songInstanceGuid = root_of(graph, "MusicGraphAsset").instanceGuid;
+
+    WaveFacts facts;
+    facts.instance = root_of(wave, "NewWaveAsset").instanceGuid;
+    facts.prefetchId = result.prefetchId;
+    facts.streamId = result.streamId;
+    facts.prefetchSize = static_cast<std::uint32_t>(result.prefetch.size());
+    facts.streamSize = static_cast<std::uint32_t>(result.stream.size());
+    facts.samples = samples;
+    facts.name = waveName;
+    result.assets.push_back({lowered(waveName), ebx::write_document(wave)});
+    result.assets.push_back({lowered(songName), ebx::write_document(graph)});
+    result.resources.push_back({lowered(waveName),
+                                wave_resource(std::vector<std::byte>(templateBlob.begin(), templateBlob.end()),
+                                              templateFacts, facts)});
+    return result;
+}
+
 // ---- the mod -----------------------------------------------------------------------------------
 
 std::string skate_sha256(const fs::path& game) {
@@ -713,10 +872,6 @@ music::PackResult build(const music::PackOptions& options, const fs::path& out, 
         throw std::runtime_error("The template wave has no sound-bank resource");
     const auto templateBlob = data.read(*bundle->payload(fb::AssetKind::resource, templateResourceIndex));
 
-    const auto lowered = [](std::string text) {
-        std::ranges::transform(text, text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        return text;
-    };
     std::vector<Built> assets, resources;
     std::vector<fb::TocChunk> chunks;
     std::vector<std::byte> cas;   // the manifest goes in front once everything else is placed
@@ -744,83 +899,83 @@ music::PackResult build(const music::PackOptions& options, const fs::path& out, 
         song.slug = music::unique_slug(song.slug, slugs);
         songs.push_back(std::move(song));
     }
+    // The encode loop is two blocking ffmpeg processes per song and almost nothing else, so songs
+    // go through in parallel. encode_song() keeps to per-song state; the two shared things, the
+    // playlist document and the chunk/asset vectors, are only touched below, in song order, so the
+    // mod comes out exactly as the one-song-at-a-time loop left it.
+    std::vector<EncodedSong> encodedSongs(songs.size());
+    std::atomic<std::size_t> next{0};
+    std::atomic<bool> failed{false};
+    std::mutex reportLock; // ProgressFn is called from workers, so it must never run re-entrantly
+    const auto reportSong = [&](std::size_t index, const char* stage, std::string detail = {}) {
+        std::lock_guard lock(reportLock);
+        report(index, stage, std::move(detail));
+    };
+    auto worker = [&] {
+        for (std::size_t index = next++; index < songs.size(); index = next++) {
+            if (cancel && *cancel) return;   // the check below turns this into music::Cancelled
+            // A song that failed stops the rest, as it did when this loop was one song at a time:
+            // there is no point spending another hour of ffmpeg on a mod that cannot be written.
+            // This is a flag rather than a scan of encodedSongs: the other workers are still
+            // assigning into that vector, and reading their error pointers while they do is a race.
+            if (failed.load(std::memory_order_relaxed)) return;
+            try {
+                reportSong(index, "encoding");
+                auto song = encode_song(songs[index], index, options.bitrate, options.normalize, scratch,
+                                        waveBytes, songBytes, templateWave.fileGuid, templateHeader,
+                                        templatePrefetch, templateFacts, templateBlob);
+                reportSong(index, "encoded", song.detail);
+                encodedSongs[index] = std::move(song);
+            } catch (...) {
+                encodedSongs[index].error = std::current_exception();
+                failed.store(true, std::memory_order_relaxed);
+            }
+        }
+    };
+    std::vector<std::thread> pool;
+    try {
+        for (std::size_t slot = 0, slots = std::min(songs.size(), encode_slots_for(options)); slot < slots; ++slot)
+            pool.emplace_back(worker);
+    } catch (...) {
+        for (auto& thread : pool) thread.join(); // a joinable thread destroyed here is std::terminate
+        throw;
+    }
+    for (auto& thread : pool) thread.join();
+    // A cancel is what the user asked for, so it outranks an ffmpeg error that happened to land
+    // in the same window. Otherwise the first real failure wins, in song order, so what the user
+    // is told does not depend on which thread happened to finish first.
+    if (cancel && *cancel) throw music::Cancelled();
+    for (const auto& song : encodedSongs)
+        if (song.error) std::rethrow_exception(song.error);
+
+    // Every chunk size is known now, so the archive is sized once instead of doubling its way up
+    // (which copies the whole library each time and briefly holds one and a half copies of it).
+    std::size_t archiveBytes = 0;
+    for (const auto& song : encodedSongs) archiveBytes += song.prefetch.size() + song.stream.size();
+    chunkBytes.reserve(archiveBytes);
+
     for (std::size_t index = 0; index < songs.size(); ++index) {
-        if (cancel && *cancel) throw music::Cancelled();
-        const auto& song = songs[index];
-        report(index, "encoding");
-
-        const auto encoded = encode(song, options.bitrate, options.normalize, scratch);
-        const auto& opus = encoded.opus;
-        const auto samples = playable_samples(opus);
-        const auto header = codec_header(templateHeader, samples);
-        const auto stream = stream_chunk(opus, header);
-        const auto prefetch = prefetch_chunk(templatePrefetch, opus, header, stream);
-        char detail[96];
-        std::snprintf(detail, sizeof detail, "%.1f s, %zu packets, %zu KB%s", opus.samples / 48000.0, opus.packets.size(), stream.size() / 1024,
-                      encoded.cached ? " (cached)" : "");
-        report(index, "encoded", detail);
-
-        // The wave: fresh partition, its own two chunks. Parsed anew per song: a copied
-        // Document shares its instances' objects with the original.
-        auto wave = ebx::read_document(waveBytes);
-        renew(wave);
-        auto& waveRoot = *root_of(wave, "NewWaveAsset").object;
-        const auto waveName = std::string(asset_folder) + song.slug + "_NWA";
-        field(waveRoot, "Name").value.data = waveName;
-        auto& waveChunks = std::get<ebx::Value::Array>(field(waveRoot, "Chunks").value.data);
-        if (waveChunks.size() != 2) throw std::runtime_error("Template wave does not have two chunks");
+        auto& song = encodedSongs[index];
+        playlist.imports.push_back({song.songFileGuid, song.songInstanceGuid});
+        std::get<ebx::Value::Array>(field(*root_of(playlist, "MusicPlaylistAsset").object, "Assets").value.data)
+            .push_back(ebx::Value{ebx::PointerReference{ebx::PointerKind::external,
+                                                        static_cast<std::int32_t>(playlist.imports.size() - 1)}});
         for (std::size_t k = 0; k < 2; ++k) {
-            const auto& bytes = k == 0 ? prefetch : stream;
-            auto& entry = *std::get<std::shared_ptr<ebx::Object>>(waveChunks[k].data);
+            const auto& bytes = k == 0 ? song.prefetch : song.stream;
             fb::TocChunk chunk;
-            chunk.guid = new_guid();
-            field(entry, "ChunkId").value.data = chunk.guid;
-            set_number(field(entry, "ChunkSize"), bytes.size());
+            chunk.guid = k == 0 ? song.prefetchId : song.streamId;
             chunks.push_back(chunk);
             chunkData.push_back({chunkBytes.size(), bytes.size()});
             chunkBytes.insert(chunkBytes.end(), bytes.begin(), bytes.end());
         }
-
-        // The song: fresh partition, its music segment's wave import pointing at the new wave.
-        auto graph = ebx::read_document(songBytes);
-        const auto templateFile = templateWave.fileGuid;
-        renew(graph);
-        bool rewired = false;
-        for (auto& import : graph.imports)
-            if (import.fileGuid == templateFile) {
-                import = {wave.fileGuid, root_of(wave, "NewWaveAsset").instanceGuid};
-                rewired = true;
-            }
-        if (!rewired) throw std::runtime_error("Template song does not import its wave");
-        const auto songName = std::string(asset_folder) + song.slug + "_MG";
-        auto& graphRoot = *root_of(graph, "MusicGraphAsset").object;
-        field(graphRoot, "Name").value.data = songName;
-        set_number(field(graphRoot, "NameHash"), name_hash(songName));
-        auto& metadata = *root_of(graph, "DingoMusicMetadata").object;
-        field(metadata, "ArtistName").value.data = song.artist;
-        field(metadata, "TrackName").value.data = song.title;
-        // No station tag: the template's would list the song under its station (Turkish).
-        // The playlist comes from reskate-music.json instead; the licensed songs carry no
-        // tags either. The orphaned MusicAssetTag instance is harmless.
-        std::get<ebx::Value::Array>(field(graphRoot, "TagRefs").value.data).clear();
-        std::get<ebx::Value::Array>(field(graphRoot, "Tags").value.data).clear();
-
-        playlist.imports.push_back({graph.fileGuid, root_of(graph, "MusicGraphAsset").instanceGuid});
-        std::get<ebx::Value::Array>(field(*root_of(playlist, "MusicPlaylistAsset").object, "Assets").value.data)
-            .push_back(ebx::Value{ebx::PointerReference{ebx::PointerKind::external,
-                                                        static_cast<std::int32_t>(playlist.imports.size() - 1)}});
-
-        WaveFacts facts;
-        facts.instance = root_of(wave, "NewWaveAsset").instanceGuid;
-        facts.prefetchId = chunks[chunks.size() - 2].guid;
-        facts.streamId = chunks.back().guid;
-        facts.prefetchSize = static_cast<std::uint32_t>(prefetch.size());
-        facts.streamSize = static_cast<std::uint32_t>(stream.size());
-        facts.samples = samples;
-        facts.name = waveName;
-        assets.push_back({lowered(waveName), ebx::write_document(wave)});
-        assets.push_back({lowered(songName), ebx::write_document(graph)});
-        resources.push_back({lowered(waveName), wave_resource(templateBlob, templateFacts, facts)});
+        // The bytes now live in chunkBytes. Holding them here as well would keep two copies of
+        // the whole library resident, where the one-song-at-a-time loop kept one. Swap rather than
+        // shrink_to_fit, whose release is a request the standard does not oblige anyone to honour:
+        // giving the capacity back is the entire point of these two lines.
+        std::vector<std::byte>().swap(song.prefetch);
+        std::vector<std::byte>().swap(song.stream);
+        for (auto& asset : song.assets) assets.push_back(std::move(asset));
+        for (auto& resource : song.resources) resources.push_back(std::move(resource));
     }
 
     report(files.size(), "building");
@@ -1045,7 +1200,9 @@ std::string unique_slug(const std::string& base, std::set<std::string>& used) {
 }
 
 std::vector<std::byte> image_artwork_png(const fs::path& image) {
-    const auto temporary = scratch_folder() / L"image-preview.png";
+    // Named afresh per call, like every other scratch file: `ffmpeg -y` truncates its output, and
+    // this one is reachable both from pack() and from the GUI's cover preview.
+    const auto temporary = scratch_folder() / widen("image-preview_" + to_hex(new_guid().bytes) + ".png");
     std::error_code ignored;
     fs::remove(temporary, ignored);
     try {
@@ -1120,6 +1277,16 @@ std::vector<SongInfo> scan(std::span<const fs::path> files) {
         songs.push_back(std::move(song));
     }
     return songs;
+}
+
+std::size_t encode_slots_for(const PackOptions& options) {
+    // options.jobs is the explicit request and wins; RESKATE_JOBS is the power-user/CI override;
+    // otherwise half the logical CPUs, since each ffmpeg already wants several threads of its own.
+    if (options.jobs > 0) return capped_slots(options.jobs);
+    int asked = 0;
+    if (const auto set = platform::environment("RESKATE_JOBS"); !set.empty() && count_from(set, asked))
+        return capped_slots(asked);
+    return automatic_slots();
 }
 
 PackResult pack(const PackOptions& options, const std::vector<SongInfo>& songs, const ProgressFn& progress,
@@ -1325,12 +1492,30 @@ fs::path export_thunderstore(const fs::path& modFolder, const ThunderstoreOption
     std::string version = options.version.empty() ? "1.0.0" : options.version;
     if (std::count(version.begin(), version.end(), '.') != 2) version = "1.0.0";
 
-    const auto staging = scratch_folder() / L"thunderstore_staging";
+    // A fixed name would be stomped by a second packer process, or by an export running while a
+    // build is in flight, so the name is fresh every time and a guard takes it away again even
+    // when the packaging below throws.
+    const auto staging = scratch_folder() / widen("thunderstore_staging_" + to_hex(new_guid().bytes));
     std::error_code ec;
-    fs::remove_all(staging, ec);
     fs::create_directories(staging, ec);
+    struct Staging { fs::path path; ~Staging() { std::error_code ignored; fs::remove_all(path, ignored); } } stagingGuard{staging};
+
+    // Resolved before the copy loop, so a zip left beside the mod by an earlier export cannot be
+    // swept into the next one when the output folder is inside the mod.
+    const auto zipName = widen(author + "-" + name + "-" + version + ".zip");
+    fs::path outZip = options.output;
+    if (outZip.empty()) {
+        outZip = modFolder.parent_path() / zipName;
+    } else if (fs::is_directory(outZip, ec)) {
+        outZip = outZip / zipName;
+    }
+    fs::create_directories(outZip.parent_path(), ec);
+    const auto zipTarget = outZip.lexically_normal();
 
     for (const auto& entry : fs::directory_iterator(modFolder)) {
+        // Anything holding the zip is holding a previous package: skip that whole subfolder.
+        const auto inside = zipTarget.lexically_relative(entry.path().lexically_normal());
+        if (!inside.empty() && *inside.begin() != L"..") continue;
         auto leaf = entry.path().filename().wstring();
         std::transform(leaf.begin(), leaf.end(), leaf.begin(), ::towlower);
         if (leaf == L"manifest.json" || leaf == L"icon.png" || leaf == L"readme.md" ||
@@ -1378,17 +1563,9 @@ fs::path export_thunderstore(const fs::path& modFolder, const ThunderstoreOption
         write_file(staging / L"icon.png", create_default_icon_png());
     }
 
-    const auto zipName = widen(author + "-" + name + "-" + version + ".zip");
-    fs::path outZip = options.output;
-    if (outZip.empty()) {
-        outZip = modFolder.parent_path() / zipName;
-    } else if (fs::is_directory(outZip, ec)) {
-        outZip = outZip / zipName;
-    }
     if (fs::exists(outZip, ec)) fs::remove(outZip, ec);
 
     zip_write(outZip, staging);
-    fs::remove_all(staging, ec);
 
     if (!fs::exists(outZip, ec))
         throw std::runtime_error("Failed to create Thunderstore package at " + narrow(outZip.wstring()));

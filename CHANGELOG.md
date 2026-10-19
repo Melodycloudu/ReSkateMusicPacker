@@ -5,6 +5,12 @@ All notable changes to ReSkate Music Packer are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+> **Fork note:** this is the parallel-encoding fork of
+> [ReSkateMusicPacker](https://github.com/DeckardDetribine/ReSkateMusicPacker). The parallel
+> encoding, measurement-cache, scratch-file safety and ThreadSanitizer entries below are this
+> fork's additions on top of upstream 1.1.2. See the [README](README.md#benchmark) for the measured
+> speed-up and the [full comparison](README.md#what-changed-from-the-original).
+
 ## [Unreleased]
 
 ### Added
@@ -16,13 +22,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cache found inside Proton/Wine prefixes, and case-insensitive lookup of the game's files on Linux.
 - CI builds and tests macOS (Apple Silicon) and Linux (GCC and Clang) beside Windows.
 - `cas_codec_tests`: Kraken/Selkie/Leviathan fixtures through `decode_cas()` off Windows.
+- **Parallel encoding is now a setting**: choose how many songs are encoded at once from
+  Settings → Parallel encoding (remembered between runs), or per build with `--jobs <n>`
+  (see [encoding in parallel](docs/cli.md#encoding-in-parallel)). Defaults to one job per two
+  logical CPUs, capped at 64. `RESKATE_JOBS` still works and is overridden by both. The job
+  count changes only how long a build takes, never the mod it produces.
+- The loudness measurement is cached separately from the audio, so rebuilding at another bitrate
+  re-encodes without decoding every song a second time just to measure it.
 
 ### Changed
 
+- **Songs encode in parallel**: one ffmpeg process per slot instead of one at a time, which is most
+  of a pack's wall clock. Songs still come out in the order they were given, and a song that fails
+  still stops the rest. Cancelling stops new songs starting; the ones already encoding are left to
+  finish, so a cancel can take a moment.
 - ffmpeg/ffprobe run with an argument list (no command line to quote), so file names with quotes,
   `$` or backticks reach them unchanged on every platform.
 - SHA-1/SHA-256 are computed in portable code (`src/sha.cpp`) instead of BCrypt.
 - Platform code is split out: `platform_*.cpp`, `file_dialog_*`, `artwork_*.cpp`, `gui_renderer_*`.
+
+### Fixed
+
+- Two copies of the same audio file, added under different names, no longer hand `ffmpeg -y` the
+  same scratch path and overwrite each other mid-encode.
+- A cached encode is now written under a name of its own and renamed into place, so a rebuild running
+  alongside another can never read a half-written cache entry.
+- Thunderstore export no longer uses one fixed staging folder, so two exports (or an export during a
+  build) cannot tread on each other, and the folder is cleaned up even when packaging fails.
+- Exporting into a folder inside the mod no longer sweeps the previous `.zip` into the next package.
 
 ## [1.1.2] - 2026-10-05
 

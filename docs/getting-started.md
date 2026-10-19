@@ -33,6 +33,8 @@ Run `ReSkateMusicPacker.exe` (Windows), `ReSkateMusicPacker.app` (macOS) or `ReS
    extracted. The automatic download is Windows-only; on macOS and Linux install ffmpeg with your
    package manager and press **Check again**. Both settings are remembered in the settings file (see
    [where the files live](troubleshooting.md#where-the-files-live)).
+   Songs are encoded several at a time by default. **Settings... → Parallel encoding** changes how many,
+   and shows the count it will actually use (see [encoding in parallel](cli.md#encoding-in-parallel)).
 3. **Add songs** - drag files or a folder onto the window, or use the picker. Each song shows its
    artist/title (from tags, else the file name) and an artwork thumbnail.
 4. **Name and playlist** - give the mod a name and the playlist it should appear under in the in-game

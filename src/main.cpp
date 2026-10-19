@@ -30,6 +30,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <charconv>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -40,6 +41,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -57,6 +59,11 @@ using platform::widen;
 
 constexpr int window_width = 1100, window_height = 700;
 constexpr const char* bitrates[]{"128", "160", "192", "256", "320"};
+
+// Songs encoded at once. 0 is Auto; the rest are explicit counts.
+constexpr const char* job_labels[]{"Auto", "1 song", "2 songs", "4 songs", "8 songs", "16 songs", "32 songs"};
+constexpr int job_counts[] = {0, 1, 2, 4, 8, 16, 32};
+constexpr int job_choices = static_cast<int>(std::size(job_labels));
 
 float g_scale = 1.0f;
 inline float S(float value) { return value * g_scale; }
@@ -82,6 +89,7 @@ template<std::size_t N> void copy_text(std::array<char, N>& to, const std::strin
 // ---- Settings: the game folder and where ffmpeg is, in %APPDATA%\ReSkateMusicPacker (see platform.h) --
 struct Settings {
     fs::path game, ffmpeg;
+    int jobs{};  // songs encoded at once; 0 picks one from the CPU count
 };
 fs::path settings_file() {
     const auto base = platform::config_directory();
@@ -95,6 +103,8 @@ Settings load_settings() {
         const auto root = Json::parse(std::string(std::istreambuf_iterator<char>(in), {}));
         settings.game = widen(root.value("game", ""));
         settings.ffmpeg = widen(root.value("ffmpeg", ""));
+        settings.jobs = root.value("jobs", 0);
+        if (settings.jobs < 0) settings.jobs = 0;
     } catch (...) {}
     return settings;
 }
@@ -102,6 +112,7 @@ void save_settings(const Settings& settings) {
     auto root = Json::object();
     root["game"] = narrow(settings.game.wstring());
     root["ffmpeg"] = narrow(settings.ffmpeg.wstring());
+    root["jobs"] = settings.jobs;
     std::error_code ignored;
     fs::create_directories(settings_file().parent_path(), ignored);
     std::ofstream(settings_file(), std::ios::binary) << root.dump(2) << "\n";
@@ -640,6 +651,7 @@ void build(App& app) {
     options.playlist = app.playlist.data();
     options.bitrate = std::stoi(bitrates[app.bitrate]);
     options.normalize = app.normalize;
+    options.jobs = app.settings.jobs;
     options.playlist_artwork = app.playlist_artwork;
     options.generated_playlist_artwork = app.generated_playlist_artwork;
     std::vector<music::SongInfo> songs;
@@ -653,8 +665,9 @@ void build(App& app) {
         try {
             const auto packed = music::pack(options, songs, [&app](const music::Progress& step) {
                 std::lock_guard lock(app.mutex);
-                const auto done = static_cast<float>(step.song) + (std::string(step.stage) == "encoded" ? 1.f : 0.f);
-                app.progress = std::min(done / static_cast<float>(step.count + 1), 1.f);
+                // Songs now finish out of order, so the bar only ever moves forward.
+                const auto done = static_cast<float>(step.song) + (std::string_view(step.stage) == "encoded" ? 1.f : 0.f);
+                app.progress = std::max(app.progress, std::min(done / static_cast<float>(step.count + 1), 1.f));
                 app.progress_text = step.song < step.count ? std::string(step.stage) + " song " + std::to_string(step.song + 1) + " of " +
                                                                  std::to_string(step.count)
                                                            : std::string(step.stage) + " the mod";
@@ -834,6 +847,45 @@ void ffmpeg_page(App& app, NativeWindow window) {
 }
 
 // Reconfigures the game folder and ffmpeg after first-run setup; reachable from any page.
+// The Settings modal's parallelism section, split out because it is the only part that reads the
+// packer's own arithmetic rather than just storing what the user picked.
+void parallel_settings(App& app) {
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(0.22f, 0.65f, 1.0f, 1.0f), "Parallel encoding");
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + S(540));
+    ImGui::TextWrapped("Songs are encoded by several ffmpeg processes at once. This changes only how long a "
+                       "build takes, never the mod it produces.");
+    ImGui::PopTextWrapPos();
+
+    int selected = 0;
+    for (int i = 0; i < job_choices; ++i)
+        if (job_counts[i] == app.settings.jobs) { selected = i; break; }
+    ImGui::SetNextItemWidth(S(300));
+    if (ImGui::Combo("##jobs", &selected, job_labels, job_choices)) {
+        app.settings.jobs = job_counts[selected];
+        save_settings(app.settings);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Songs encoded at once. Auto uses half the logical CPUs.");
+
+    // Ask the packer what it would actually do, so the line below cannot drift from the real rule
+    // (including a RESKATE_JOBS override the user set outside the app).
+    const auto effective = music::encode_slots_for(music::PackOptions{});
+    const auto cores = std::max(1u, std::thread::hardware_concurrency());
+    const auto set_in_environment = platform::environment("RESKATE_JOBS");
+    std::string summary;
+    if (!set_in_environment.empty()) {
+        summary = "Using RESKATE_JOBS=" + set_in_environment + " from the environment: " +
+                  std::to_string(effective) + (effective == 1 ? " song." : " songs.") +
+                  " This setting applies once that variable is unset.";
+    } else {
+        summary = std::to_string(effective) + (effective == 1 ? " song at a time." : " songs at a time.") +
+                  " on " + std::to_string(cores) + (cores == 1 ? " logical core." : " logical cores.");
+        if (app.settings.jobs == 0) summary += " Auto uses half of them; fewer songs keeps the machine responsive.";
+    }
+    ImGui::TextDisabled("%s", summary.c_str());
+}
+
 void settings_modal(App& app, NativeWindow window) {
     if (app.settings_open) { ImGui::OpenPopup("Settings"); app.settings_open = false; }
     if (!ImGui::BeginPopupModal("Settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
@@ -877,6 +929,8 @@ void settings_modal(App& app, NativeWindow window) {
             } else set_status(app, "That folder has no " + ffmpeg_pair + ".", true);
         }
     }
+
+    parallel_settings(app);
 
     ImGui::PopTextWrapPos();
     ImGui::Separator();
@@ -2155,6 +2209,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
 #endif
 
 int run_cli(int argc, wchar_t** argv) {
+    // A number flag that is not a number is a usage error, not an unhandled std::invalid_argument.
+    const auto number = [](const std::wstring& text, int& out) {
+        const auto digits = narrow(text);
+        const auto* first = digits.data();
+        const auto [stop, error] = std::from_chars(first, first + digits.size(), out);
+        return error == std::errc{} && stop == first + digits.size();
+    };
     music::PackOptions options;
     std::vector<fs::path> positional;
     bool thunderstore = false;
@@ -2174,6 +2235,8 @@ int run_cli(int argc, wchar_t** argv) {
                         "  --playlist <playlist>      Playlist name shown in-game (default: folder name)\n"
                         "  --bitrate <kbps>           Opus bitrate 64-320 kbps (default: 192)\n"
                         "  --no-normalize             Disable EBU R128 loudness normalization\n"
+                        "  --jobs <n>                 Songs to encode at once (default: half the logical CPUs,\n"
+                        "                             max 64; does not change the mod produced)\n"
                         "  --thunderstore             Export a Thunderstore-ready zip package\n"
                         "  --author <name>            Thunderstore package author (default: Author)\n"
                         "  --version <x.y.z>          Thunderstore package version (default: 1.0.0)\n"
@@ -2191,6 +2254,12 @@ int run_cli(int argc, wchar_t** argv) {
         else if (arg == L"--bitrate" && i + 1 < argc) options.bitrate = std::stoi(argv[++i]);
         else if (arg == L"--playlist" && i + 1 < argc) options.playlist = narrow(argv[++i]);
         else if (arg == L"--no-normalize") options.normalize = false;
+        else if (arg == L"--jobs" && i + 1 < argc) {
+            if (!number(argv[++i], options.jobs)) {
+                std::fprintf(stderr, "error: --jobs needs a number, not '%s'\n", narrow(argv[i]).c_str());
+                return 1;
+            }
+        }
         else if (arg == L"--thunderstore") thunderstore = true;
         else if (arg == L"--author" && i + 1 < argc) author = narrow(argv[++i]);
         else if (arg == L"--version" && i + 1 < argc) version = narrow(argv[++i]);
@@ -2236,6 +2305,10 @@ int run_cli(int argc, wchar_t** argv) {
             std::fprintf(stderr, "error: %s\n", error.what());
             return 2;
         }
+    }
+    if (options.jobs < 0) {
+        std::fprintf(stderr, "error: --jobs must be 1 or more (or 0 to choose from the CPU count)\n");
+        return 1;
     }
     if (positional.size() < 2 || positional.size() > 3 || options.bitrate < 64 || options.bitrate > 320) {
         std::fprintf(stderr, "Usage: %s <game folder> <song folder> [output folder] [options]\n"
@@ -2283,9 +2356,11 @@ int run_cli(int argc, wchar_t** argv) {
         for (const auto& name : options.generated_playlist_artwork)
             if (name != options.playlist) throw std::runtime_error("Generated artwork names an unknown playlist: " + name);
         const auto result = music::pack(options, songs, [&](const music::Progress& step) {
-            const std::string stage = step.stage;
-            if (stage == "encoding") std::printf("%s - %s\n", songs[step.song].artist.c_str(), songs[step.song].title.c_str());
-            else if (stage == "encoded") std::printf("  %s\n", step.detail.c_str());
+            // A song's name goes out with its own detail rather than on the way in: songs encode
+            // in parallel, so one song's "encoding" and another's "encoded" would interleave.
+            if (std::string_view(step.stage) == "encoded")
+                std::printf("%s - %s\n  %s\n", songs[step.song].artist.c_str(), songs[step.song].title.c_str(),
+                            step.detail.c_str());
         });
         std::printf("%zu song(s), %zu KB of audio -> %s\n", result.songs, result.audioKb, narrow(result.output.wstring()).c_str());
         if (thunderstore) {

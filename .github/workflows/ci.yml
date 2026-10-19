@@ -62,3 +62,42 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build --output-on-failure --no-tests=error
+
+  # pack() encodes songs on a thread pool, and ThreadSanitizer is the only thing that reliably
+  # catches a race in it. This job covers the tests that run without a game install: the engine's
+  # own code (CAS decode, JSON, EBX/TOC) and the library entry points that reach it. pack() itself
+  # needs a ReSkate install to read its template assets, which cannot live in CI, so its end-to-end
+  # half is skipped here; run it locally against an install with:
+  #   cmake -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_COMPILER=clang
+  #         -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_FLAGS="-fsanitize=thread -g -O1"
+  #         -DCMAKE_CXX_FLAGS="-fsanitize=thread -g -O1" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+  #   cmake --build build-tsan --target ReSkateMusicPackerTests
+  #   ./build-tsan/ReSkateMusicPackerTests "F:\Games\ReSkate-1.0.0"
+  # Only the test targets are built: the GUI app and imgui are third-party code that reports races
+  # of its own and are not what this job is for.
+  tsan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SDL2, ffmpeg and a font
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libsdl2-dev ffmpeg fonts-dejavu-core
+
+      - name: Configure (Debug, TSan)
+        run: >-
+          cmake -B build -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          -DCMAKE_C_FLAGS="-fsanitize=thread -g -O1"
+          -DCMAKE_CXX_FLAGS="-fsanitize=thread -g -O1"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+
+      - name: Build the tests
+        run: >-
+          cmake --build build -j 4 --target
+          ReSkateMusicPackerTests ReSkateArtworkTests
+          ReSkateFfmpegTests ReSkateCasCodecTests
+
+      - name: Test under ThreadSanitizer
+        run: ctest --test-dir build --output-on-failure --no-tests=error

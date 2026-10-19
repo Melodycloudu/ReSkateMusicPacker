@@ -6,3 +6,5 @@ build-*/
 *.exe.recipe
 *.ilk
 *.pdb
+__pycache__/
+*.pyc

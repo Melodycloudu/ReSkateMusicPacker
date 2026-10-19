@@ -28,6 +28,8 @@ std::string command_line(const std::vector<std::string>& args);
 
 // An environment variable as UTF-8; empty when unset.
 std::string environment(const char* name);
+// Sets it for this process (empty value unsets it), so a setting read at runtime can be exercised.
+void set_environment(const char* name, std::string_view value);
 // Puts `folder` first on this process's PATH (once), so run_process finds programs in it.
 void add_to_path(const std::filesystem::path& folder);
 // Whether `name` (without executable_suffix) is a file in a PATH folder.

@@ -5,7 +5,9 @@
 #include "packer.h"
 #include "ffmpeg_fetch.h"
 #include "Engine/Core/Json/json.h"
+#include "Engine/Resource/toc.h"
 #include "platform.h"
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <atomic>
@@ -14,8 +16,11 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <thread>
+#include <vector>
 
 namespace fs = std::filesystem;
+namespace fb = dingosdk::frostbite;
 
 namespace {
 int failures = 0;
@@ -33,9 +38,39 @@ std::string arg(const fs::path& path) { return platform::narrow(path.wstring());
 void fixture(const std::vector<std::string>& args, const char* what) {
     if (platform::run_process(args) != 0) { std::printf("FAIL: %s\n", what); std::exit(1); }
 }
-void tone(const fs::path& file, int hertz, const char* artist, const char* title) {
-    fixture({"ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=" + std::to_string(hertz) + ":duration=3",
+void tone(const fs::path& file, int hertz, const char* artist, const char* title, int seconds = 3) {
+    fixture({"ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+             "-i", "sine=frequency=" + std::to_string(hertz) + ":duration=" + std::to_string(seconds),
              "-metadata", std::string("artist=") + artist, "-metadata", std::string("title=") + title, arg(file)}, "ffmpeg");
+}
+
+// The patched TOC's chunk sizes, in song order. Chunk offsets are handed out in song order, so
+// sorting by them recovers which song each chunk belongs to without depending on the order
+// read_toc happens to hand chunks back in.
+std::vector<std::uint32_t> chunk_sizes_in_song_order(const fs::path& mod) {
+    const auto text = slurp(mod / L"Win32/levels/game/bam_levelroot/bam_levelroot.toc");
+    std::vector<std::byte> bytes(text.size());
+    std::memcpy(bytes.data(), text.data(), text.size());
+    const auto toc = fb::read_toc(bytes);
+    std::vector<const fb::TocChunk*> ordered;
+    ordered.reserve(toc.chunks.size());
+    for (const auto& chunk : toc.chunks) ordered.push_back(&chunk);
+    std::sort(ordered.begin(), ordered.end(), [](const fb::TocChunk* a, const fb::TocChunk* b) {
+        return a->offset < b->offset;
+    });
+    std::vector<std::uint32_t> sizes;
+    sizes.reserve(ordered.size());
+    for (const auto* chunk : ordered) sizes.push_back(chunk->size);
+    return sizes;
+}
+
+// "artist - title" for each song in a playlist, so a tracklist's order can be compared to input order.
+std::vector<std::string> tracklist(const fs::path& mod, std::size_t playlist) {
+    const auto meta = dingosdk::Json::parse(slurp(mod / L"reskate-music.json"));
+    const auto& list = meta.at("playlists").at(playlist).at("songs");
+    std::vector<std::string> ids;
+    for (std::size_t i = 0; i < list.size(); ++i) ids.push_back(list.at(i).string());
+    return ids;
 }
 } // namespace
 
@@ -63,6 +98,32 @@ int run_tests(const std::vector<fs::path>& argv) {
         check(music::sanitize_text("\xe2\x80\x9cHi\xe2\x80\x9d") == "\"Hi\"", "curly double quotes fold to ASCII");
         check(music::slug_of("P\xe2\x80\x99Z", "x") == music::slug_of("P'Z", "x"),
               "smart and ASCII apostrophes slug the same");
+
+        // Pure arithmetic on the job count, so this runs without a game install: an explicit count
+        // beats the environment, the environment beats the CPU default, and neither is a way to
+        // ask for an unreasonable number of ffmpeg processes.
+        const auto automatic = std::max<std::size_t>(1, std::thread::hardware_concurrency() / 2);
+        music::PackOptions probe;
+        platform::set_environment("RESKATE_JOBS", "");
+        check(music::encode_slots_for(probe) == automatic, "with nothing set, half the logical CPUs are used");
+        probe.jobs = 3;
+        check(music::encode_slots_for(probe) == 3, "an explicit job count is used as given");
+        platform::set_environment("RESKATE_JOBS", "7");
+        check(music::encode_slots_for(probe) == 3, "an explicit job count overrides RESKATE_JOBS");
+        probe.jobs = 0;
+        check(music::encode_slots_for(probe) == 7, "RESKATE_JOBS is used when no job count is set");
+        for (const auto* junk : {"-1", "abc", " 4", "4x", "0", "99999999999999999999"}) {
+            platform::set_environment("RESKATE_JOBS", junk);
+            check(music::encode_slots_for(probe) == automatic,
+                  "a RESKATE_JOBS value that is not a plain positive number is ignored");
+        }
+        platform::set_environment("RESKATE_JOBS", "9999");
+        check(music::encode_slots_for(probe) == 64, "RESKATE_JOBS is capped so it cannot fork-bomb");
+        probe.jobs = 9999;
+        check(music::encode_slots_for(probe) == 64, "an explicit job count is capped the same way");
+        probe.jobs = -5;
+        check(music::encode_slots_for(probe) == 64, "a negative job count is capped, not cast to a huge one");
+        platform::set_environment("RESKATE_JOBS", "");
     }
 
     const fs::path game = argc > 1 ? argv[1] : L"F:/Games/ReSkate-1.0.0";
@@ -72,7 +133,9 @@ int run_tests(const std::vector<fs::path>& argv) {
     fs::remove_all(root);
     fs::create_directories(root / L"songs");
     tone(root / L"songs" / L"a.mp3", 440, "Test Artist", "Tone A");
-    tone(root / L"songs" / L"b.flac", 880, "Test Artist", "Tone B");
+    // The second tone is three times as long, so a mod whose chunks came back in the wrong order
+    // shows up as a large chunk where a small one belongs.
+    tone(root / L"songs" / L"b.flac", 880, "Test Artist", "Tone B", 9);
     const std::vector<fs::path> files{root / L"songs" / L"a.mp3", root / L"songs" / L"b.flac"};
 
     auto songs = music::scan(files);
@@ -217,6 +280,69 @@ int run_tests(const std::vector<fs::path>& argv) {
     fs::remove(customZip);
     fs::remove_all(customOutDir);
 
+    // Songs keep their given order however many are in flight, and the job count changes only how
+    // many, never the result. Tone A is 3s and Tone B 9s, so a mod whose two songs' audio came
+    // back swapped puts the big chunks first and fails the size check below.
+    {
+        auto ordered = songs;
+        ordered[1].playlist.clear();  // one playlist, so its tracklist has an order to keep
+        std::vector<std::vector<std::uint32_t>> seen;
+        const auto pack_once = [&](const std::string& name) {
+            options.output = root / platform::widen(name);
+            const auto packed = music::pack(options, ordered);
+            check(packed.songs == 2, "a pack with a job count set still builds both songs");
+            const auto ids = tracklist(options.output, 0);
+            check(ids.size() == 2 && ids[0] == "Test Artist - Tone A" && ids[1] == "Test Artist - Tone B",
+                  "the tracklist keeps the songs in the order they were given");
+            const auto sizes = chunk_sizes_in_song_order(options.output);
+            check(sizes.size() == 4, "the patched TOC holds two chunks per song");
+            if (sizes.size() == 4) {
+                check(sizes[0] < sizes[1] && sizes[2] < sizes[3], "each prefetch chunk is smaller than its stream");
+                check(sizes[1] < sizes[3] && sizes[0] < sizes[2], "each song's audio stays in its own slot");
+            }
+            seen.push_back(sizes);
+        };
+        for (const auto* jobs : {"1", "4", "4096", "0", "-3", "eight", " 2"}) {
+            platform::set_environment("RESKATE_JOBS", jobs);
+            options.jobs = 0;  // the environment decides
+            pack_once("env_" + std::string(jobs));
+        }
+        // And the same through the option, which is the path the GUI and --jobs use. It has to win
+        // over the environment, so the environment is pinned to 1 while a larger count is asked for.
+        platform::set_environment("RESKATE_JOBS", "1");
+        for (const int jobs : {1, 2, 8}) {
+            options.jobs = jobs;
+            pack_once("opt_" + std::to_string(jobs));
+        }
+        options.jobs = 0;
+        platform::set_environment("RESKATE_JOBS", "");
+        // Every job count must produce byte-for-byte the same layout, which is only true if the
+        // songs are collected in song order rather than completion order.
+        const bool sameLayout = std::all_of(seen.begin() + 1, seen.end(),
+                                            [&](const auto& sizes) { return sizes == seen.front(); });
+        check(!seen.empty() && sameLayout, "the job count does not change the archive layout");
+    }
+
+    // One source file under two names. Both songs share an encode cache entry, so they can try to
+    // write it at the same moment, and neither may hand ffmpeg the same scratch path as the other.
+    {
+        const auto twin = root / L"songs" / L"twin.mp3";
+        tone(twin, 660, "Twin Artist", "Twin One");
+        const auto scanned = music::scan(std::span<const fs::path>{&twin, 1});
+        check(scanned.size() == 1 && scanned[0].problems.empty(), "the twin fixture scans clean");
+        if (scanned.size() == 1) {
+            music::SongInfo first = scanned[0], second = scanned[0];
+            second.title = "Twin Two";  // same bytes, different name: one cache entry, two songs
+            options.output = root / L"twins";
+            const auto packed = music::pack(options, std::vector<music::SongInfo>{first, second});
+            check(packed.songs == 2, "the same source added twice packs as two songs");
+            check(chunk_sizes_in_song_order(options.output).size() == 4, "both twins get their own chunks");
+            const auto ids = tracklist(options.output, 0);
+            check(ids.size() == 2 && ids[0] == "Twin Artist - Twin One" && ids[1] == "Twin Artist - Twin Two",
+                  "the twins keep their own names and their order");
+        }
+    }
+
     std::atomic<bool> cancel = true;
     options.output = root / L"cancelled";
     try {
@@ -225,6 +351,21 @@ int run_tests(const std::vector<fs::path>& argv) {
     } catch (const music::Cancelled&) {
     }
     check(!fs::exists(options.output) && !fs::exists(root / L"cancelled.partial"), "cancel leaves no output");
+
+    // Cancelling once a song is under way, rather than before the first one starts: with songs in
+    // flight this is the path a user actually takes, and it must still unwind to nothing.
+    std::atomic<bool> inflight = false;
+    options.output = root / L"cancelled-midway";
+    try {
+        music::pack(options, songs, [&](const music::Progress& step) {
+            if (std::string(step.stage) == "encoding") inflight = true;
+        }, &inflight);
+        check(false, "cancelling mid-encode throws Cancelled");
+    } catch (const music::Cancelled&) {
+        check(true, "cancelling mid-encode throws Cancelled");
+    }
+    check(!fs::exists(options.output) && !fs::exists(root / L"cancelled-midway.partial"),
+          "a cancel mid-encode leaves no output");
 
     options.output = root / L"auto-art";
     options.playlist_artwork.clear();
